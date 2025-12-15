@@ -98,6 +98,18 @@ func main() {
 		c.JSON(201, gin.H{"status": "created"})
 	})
 
+	r.DELETE("/:link", func(c *gin.Context) {
+		link := c.Param("link")
+
+		err := db.Delete([]byte(link), pebble.Sync)
+		if err != nil {
+			fmt.Printf("Error deleting value from database: %v\n", err)
+			c.JSON(500, gin.H{"error": "Internal server error"})
+			return
+		}
+		c.JSON(200, gin.H{"status": "deleted"})
+	})
+
 	fmt.Printf("Starting server on port %d\n", *port)
 
 	// run the server
