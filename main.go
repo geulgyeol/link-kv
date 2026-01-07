@@ -36,6 +36,17 @@ func main() {
 		}
 	}(db)
 
+	saveQueue := make(chan string, 1024)
+
+	go func() {
+		for link := range saveQueue {
+			err := db.Set([]byte(link), []byte(""), pebble.Sync)
+			if err != nil {
+				fmt.Printf("Error setting value in database for link '%s': %v\n", link, err)
+			}
+		}
+	}()
+
 	r := gin.Default()
 
 	r.GET("/", func(c *gin.Context) {
@@ -88,12 +99,7 @@ func main() {
 			return
 		}
 
-		err = db.Set([]byte(link), []byte(""), pebble.Sync)
-		if err != nil {
-			fmt.Printf("Error setting value in database: %v\n", err)
-			c.JSON(500, gin.H{"error": "Internal server error"})
-			return
-		}
+		saveQueue <- link
 
 		c.JSON(201, gin.H{"status": "created"})
 	})
