@@ -40,7 +40,7 @@ func main() {
 
 	go func() {
 		for link := range saveQueue {
-			err := db.Set([]byte(link), []byte(""), pebble.Sync)
+			err := db.Set([]byte(link), []byte(""), pebble.NoSync)
 			if err != nil {
 				fmt.Printf("Error setting value in database for link '%s': %v\n", link, err)
 			}
