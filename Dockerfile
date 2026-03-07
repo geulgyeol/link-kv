@@ -23,10 +23,6 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuff
 # Final stage
 FROM --platform=$TARGETPLATFORM alpine:latest
 
-
-# Create data directory
-RUN mkdir -p /data
-
 WORKDIR /root
 
 # Copy the binary from builder
@@ -34,9 +30,6 @@ COPY --from=builder /app/geulgyeol-link-kv .
 
 # Expose the default port
 EXPOSE 8080
-
-# Set the data path as a volume
-VOLUME ["/data"]
 
 # Run the application
 ENTRYPOINT ["./geulgyeol-link-kv"]

@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io"
+	"net/url"
 	"os"
+	"strconv"
 
 	"github.com/akamensky/argparse"
-	"github.com/cockroachdb/pebble"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/geulgyeol/link-kv/db"
 )
 
 func main() {
@@ -17,35 +22,25 @@ func main() {
 	parser := argparse.NewParser("geulgyeol-link-kv", "A HTML storage server for Geulgyeol.")
 
 	port := parser.Int("p", "port", &argparse.Options{Default: 8080, Help: "Port to run the server on"})
-	dataPath := parser.String("d", "data-path", &argparse.Options{Default: "/data", Help: "Path to the Pebble database"})
+	connString := parser.String("c", "conn-string", &argparse.Options{
+		Required: true,
+		Help:     "PostgreSQL connection string",
+	})
 
 	err := parser.Parse(os.Args)
 	if err != nil {
 		panic(err)
 	}
 
-	db, err := pebble.Open(*dataPath, &pebble.Options{})
+	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, *connString)
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("Unable to connect to database: %v", err))
 	}
+	defer pool.Close()
 
-	defer func(db *pebble.DB) {
-		err := db.Close()
-		if err != nil {
-			fmt.Printf("Error closing database: %v\n", err)
-		}
-	}(db)
-
-	saveQueue := make(chan string, 1024)
-
-	go func() {
-		for link := range saveQueue {
-			err := db.Set([]byte(link), []byte(""), pebble.NoSync)
-			if err != nil {
-				fmt.Printf("Error setting value in database for link '%s': %v\n", link, err)
-			}
-		}
-	}()
+	queries := db.New(pool)
 
 	r := gin.Default()
 
@@ -53,67 +48,180 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
-	/* GET /{링크}
-	-> 200 OK / 404 Not found
+	// =========
+	// Users (CRUD)
+	// =========
 
-	POST /{링크}
-	-> 201 Created / 409 Conflict
-	*/
+	r.GET("/users", func(c *gin.Context) {
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+		if limit <= 0 || limit > 1000 {
+			limit = 50
+		}
 
-	r.GET("/:link", func(c *gin.Context) {
-		link := c.Param("link")
-
-		_, closer, err := db.Get([]byte(link))
+		users, err := queries.ListBlogUsers(c.Request.Context(), int32(limit))
 		if err != nil {
-			if errors.Is(err, pebble.ErrNotFound) {
+			fmt.Printf("Error listing users: %v\n", err)
+			c.JSON(500, gin.H{"error": "Internal server error"})
+			return
+		}
+
+		c.JSON(200, users)
+	})
+
+	r.GET("/users/:platform/:user_id", func(c *gin.Context) {
+		user, err := queries.GetBlogUser(c.Request.Context(), db.GetBlogUserParams{
+			BlogPlatform: c.Param("platform"),
+			UserID:       c.Param("user_id"),
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
 				c.JSON(404, gin.H{"error": "Not found"})
 				return
 			}
-
-			fmt.Printf("Error getting value from database: %v\n", err)
-			c.JSON(500, gin.H{"error": "Internal server error"})
-			return
-		}
-		defer func(closer io.Closer) {
-			err := closer.Close()
-			if err != nil {
-				fmt.Printf("Error closing value reader: %v\n", err)
-			}
-		}(closer)
-
-		c.JSON(200, gin.H{"status": "ok"})
-	})
-
-	r.POST("/:link", func(c *gin.Context) {
-		link := c.Param("link")
-
-		_, closer, err := db.Get([]byte(link))
-		if err == nil {
-			_ = closer.Close()
-			c.JSON(409, gin.H{"error": "Already exists"})
-			return
-		}
-
-		if !errors.Is(err, pebble.ErrNotFound) {
+			fmt.Printf("Error getting user: %v\n", err)
 			c.JSON(500, gin.H{"error": "Internal server error"})
 			return
 		}
 
-		saveQueue <- link
-
-		c.JSON(201, gin.H{"status": "created"})
+		c.JSON(200, user)
 	})
 
-	r.DELETE("/:link", func(c *gin.Context) {
-		link := c.Param("link")
+	r.POST("/users", func(c *gin.Context) {
+		var body struct {
+			BlogPlatform string `json:"blog_platform" binding:"required"`
+			UserID       string `json:"user_id" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.JSON(400, gin.H{"error": "blog_platform and user_id are required"})
+			return
+		}
 
-		err := db.Delete([]byte(link), pebble.Sync)
+		user, err := queries.CreateBlogUser(c.Request.Context(), db.CreateBlogUserParams{
+			BlogPlatform: body.BlogPlatform,
+			UserID:       body.UserID,
+		})
 		if err != nil {
-			fmt.Printf("Error deleting value from database: %v\n", err)
+			if errors.Is(err, pgx.ErrNoRows) {
+				c.JSON(409, gin.H{"error": "Already exists"})
+				return
+			}
+			fmt.Printf("Error creating user: %v\n", err)
 			c.JSON(500, gin.H{"error": "Internal server error"})
 			return
 		}
+
+		c.JSON(201, user)
+	})
+
+	r.PUT("/users/:platform/:user_id", func(c *gin.Context) {
+		params := db.UpdateBlogUserLastEnqueuedAtParams{
+			BlogPlatform: c.Param("platform"),
+			UserID:       c.Param("user_id"),
+		}
+
+		// Verify user exists first
+		_, err := queries.GetBlogUser(c.Request.Context(), db.GetBlogUserParams{
+			BlogPlatform: params.BlogPlatform,
+			UserID:       params.UserID,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				c.JSON(404, gin.H{"error": "Not found"})
+				return
+			}
+			fmt.Printf("Error getting user: %v\n", err)
+			c.JSON(500, gin.H{"error": "Internal server error"})
+			return
+		}
+
+		if err := queries.UpdateBlogUserLastEnqueuedAt(c.Request.Context(), params); err != nil {
+			fmt.Printf("Error updating user: %v\n", err)
+			c.JSON(500, gin.H{"error": "Internal server error"})
+			return
+		}
+
+		c.JSON(200, gin.H{"status": "updated"})
+	})
+
+	r.DELETE("/users/:platform/:user_id", func(c *gin.Context) {
+		err := queries.DeleteBlogUser(c.Request.Context(), db.DeleteBlogUserParams{
+			BlogPlatform: c.Param("platform"),
+			UserID:       c.Param("user_id"),
+		})
+		if err != nil {
+			fmt.Printf("Error deleting user: %v\n", err)
+			c.JSON(500, gin.H{"error": "Internal server error"})
+			return
+		}
+
 		c.JSON(200, gin.H{"status": "deleted"})
+	})
+
+	// =========
+	// Posts (Read-only)
+	// =========
+
+	r.GET("/posts", func(c *gin.Context) {
+		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+		if limit <= 0 || limit > 1000 {
+			limit = 50
+		}
+
+		platform := c.Query("platform")
+
+		if platform != "" {
+			posts, err := queries.ListBlogPostsByPlatform(c.Request.Context(), db.ListBlogPostsByPlatformParams{
+				BlogPlatform: platform,
+				Limit:        int32(limit),
+			})
+			if err != nil {
+				fmt.Printf("Error listing posts: %v\n", err)
+				c.JSON(500, gin.H{"error": "Internal server error"})
+				return
+			}
+			c.JSON(200, posts)
+			return
+		}
+
+		posts, err := queries.ListBlogPosts(c.Request.Context(), int32(limit))
+		if err != nil {
+			fmt.Printf("Error listing posts: %v\n", err)
+			c.JSON(500, gin.H{"error": "Internal server error"})
+			return
+		}
+
+		c.JSON(200, posts)
+	})
+
+	r.GET("/posts/:platform/*post_url", func(c *gin.Context) {
+		platform := c.Param("platform")
+		postURL := c.Param("post_url")
+		if len(postURL) > 0 && postURL[0] == '/' {
+			postURL = postURL[1:]
+		}
+		postURL, err := url.PathUnescape(postURL)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "Invalid post URL"})
+			return
+		}
+
+		post, err := queries.GetBlogPost(c.Request.Context(), postURL)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				c.JSON(404, gin.H{"error": "Not found"})
+				return
+			}
+			fmt.Printf("Error getting post: %v\n", err)
+			c.JSON(500, gin.H{"error": "Internal server error"})
+			return
+		}
+
+		if post.BlogPlatform != platform {
+			c.JSON(404, gin.H{"error": "Not found"})
+			return
+		}
+
+		c.JSON(200, post)
 	})
 
 	fmt.Printf("Starting server on port %d\n", *port)
