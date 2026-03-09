@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/geulgyeol/link-kv/db"
+	"github.com/geulgyeol/link-kv/local"
 )
 
 func main() {
@@ -23,9 +24,9 @@ func main() {
 
 	port := parser.Int("p", "port", &argparse.Options{Default: 8080, Help: "Port to run the server on"})
 	connString := parser.String("c", "conn-string", &argparse.Options{
-		Required: true,
-		Help:     "PostgreSQL connection string",
+		Help: "PostgreSQL connection string",
 	})
+	localMode := parser.Flag("l", "local", &argparse.Options{Help: "Whether to use emulator"})
 
 	err := parser.Parse(os.Args)
 	if err != nil {
@@ -34,13 +35,24 @@ func main() {
 
 	ctx := context.Background()
 
-	pool, err := pgxpool.New(ctx, *connString)
-	if err != nil {
-		panic(fmt.Sprintf("Unable to connect to database: %v", err))
-	}
-	defer pool.Close()
+	var queries local.LinkKVService
 
-	queries := db.New(pool)
+	if *localMode {
+		queries = local.New()
+		fmt.Println("Running in local emulation mode (in-memory storage)")
+	} else {
+		if *connString == "" {
+			panic("conn-string is required when not in local mode")
+		}
+
+		pool, err := pgxpool.New(ctx, *connString)
+		if err != nil {
+			panic(fmt.Sprintf("Unable to connect to database: %v", err))
+		}
+		defer pool.Close()
+
+		queries = db.New(pool)
+	}
 
 	r := gin.Default()
 
